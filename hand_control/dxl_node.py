@@ -58,8 +58,10 @@ class DxlControlNode(Node):
         self.addr_hardware_error = 70
         self.addr_goal_current = 102
         self.addr_goal_position = 116
+        self.addr_present_current = 126
         self.addr_present_position = 132
-        
+
+        self.len_present_current = 2
         self.len_present_position = 4
         self.len_goal_position = 4
         
@@ -80,7 +82,10 @@ class DxlControlNode(Node):
         self.portHandler = PortHandler(self.port_name)
         self.packetHandler = PacketHandler(self.protocol_version)
         
-        self.groupSyncRead = GroupSyncRead(self.portHandler, self.packetHandler, self.addr_present_position, self.len_present_position)
+        # present_current(126, 2bytes) ~ present_position(132, 4bytes) = 주소126부터 10bytes 연속 읽기
+        self.sync_read_start_addr = self.addr_present_current
+        self.sync_read_total_len = (self.addr_present_position + self.len_present_position) - self.addr_present_current  # 136-126=10
+        self.groupSyncRead = GroupSyncRead(self.portHandler, self.packetHandler, self.sync_read_start_addr, self.sync_read_total_len)
         self.groupSyncWrite = GroupSyncWrite(self.portHandler, self.packetHandler, self.addr_goal_position, self.len_goal_position)
 
         # --- [3] 포트 열기 & 초기 설정 ---
@@ -302,16 +307,23 @@ class DxlControlNode(Node):
                 present_pos = self.groupSyncRead.getData(dxl_id, self.addr_present_position, self.len_present_position)
                 if present_pos > 0x7FFFFFFF:
                     present_pos -= 4294967296
-                
+
+                # Present current 읽기 (signed 16-bit)
+                present_cur = 0
+                if self.groupSyncRead.isAvailable(dxl_id, self.addr_present_current, self.len_present_current):
+                    present_cur = self.groupSyncRead.getData(dxl_id, self.addr_present_current, self.len_present_current)
+                    if present_cur > 0x7FFF:
+                        present_cur -= 65536
+
                 status_msg_list.append(f"{dxl_id}:{present_pos}")
-                
+
                 joint_name = self.joint_name_map.get(dxl_id, f"id_{dxl_id}")
                 joint_state_msg.name.append(joint_name)
-                
+
                 # [수정됨] 개별 설정값을 사용하여 현재 위치(0.0~1.0) 역산
                 normalized_pos = 0.0
                 config = self.joint_limits.get(dxl_id)
-                
+
                 if config:
                     if config['type'] == 'FE':
                         open_pos = config['open']
@@ -319,7 +331,7 @@ class DxlControlNode(Node):
                         # Div by Zero 방지
                         if close_pos != open_pos:
                             normalized_pos = (present_pos - open_pos) / (close_pos - open_pos)
-                            
+
                     elif config['type'] == 'AA':
                         min_pos = config['min']
                         max_pos = config['max']
@@ -328,6 +340,7 @@ class DxlControlNode(Node):
                             normalized_pos = (ratio * 2.0) - 1.0
 
                 joint_state_msg.position.append(float(normalized_pos))
+                joint_state_msg.effort.append(float(present_cur))
 
         if status_msg_list:
             full_str = ", ".join(status_msg_list)
