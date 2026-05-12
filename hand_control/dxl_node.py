@@ -103,16 +103,16 @@ class DxlControlNode(Node):
             
         # --- [4] ROS 통신 설정 ---
         self.create_subscription(Bool, 'torque_cmd', self.torque_callback, 10)
-        self.create_subscription(JointState, 'goal_joint_states', self.goal_joint_state_callback, 10)
+        self.create_subscription(JointState, 'dex_mouse/goal_joint_states', self.goal_joint_state_callback, 10)
         self.create_subscription(String, 'hand_cmd', self.command_callback, 10)
         self.create_subscription(Bool, 'hand_home', self.home_callback, 10)
         self.create_subscription(Bool, 'hand_reset', self.reset_callback, 10)
         self.create_subscription(Bool, 'teleop_enable', self.teleop_enable_callback, 10)
         
         self.status_pub = self.create_publisher(String, 'hand_status', 10)
-        self.joint_state_pub = self.create_publisher(JointState, 'joint_states', 10)
+        self.joint_state_pub = self.create_publisher(JointState, 'br_hand/joint_states', 10)
         
-        self.timer = self.create_timer(0.05, self.sync_read_callback)
+        self.timer = self.create_timer(0.01, self.sync_read_callback)
         self.error_timer = self.create_timer(1.0, self.monitor_errors)
 
     def open_port(self):
