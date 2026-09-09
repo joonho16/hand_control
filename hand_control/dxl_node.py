@@ -5,7 +5,7 @@ import time
 import threading
 from rclpy.node import Node
 from dynamixel_sdk import *
-from std_msgs.msg import Bool, Int32, String
+from std_msgs.msg import Bool, Float32MultiArray, String
 from sensor_msgs.msg import JointState
 
 class DxlControlNode(Node):
@@ -54,6 +54,8 @@ class DxlControlNode(Node):
         # 컨트롤 테이블 주소
         self.addr_operating_mode = 11
         self.addr_homing_offset = 20
+        self.addr_current_limit = 38
+        self.addr_shutdown = 63
         self.addr_torque_enable = 64
         self.addr_hardware_error = 70
         self.addr_goal_current = 102
@@ -69,8 +71,9 @@ class DxlControlNode(Node):
         self.mode_current_based_position = 5
         self.torque_enable = 1
         self.torque_disable = 0
-        self.default_current_limit = 1000 
+        self.shutdown_overheating_only = 0x04
         self.homing_current_limit = 150
+        self.current_limits = {}
 
         # 상태 플래그
         self.is_homing = False
@@ -91,9 +94,7 @@ class DxlControlNode(Node):
         # --- [3] 포트 열기 & 초기 설정 ---
         if self.open_port() and self.set_baudrate():
             self.get_logger().info("Port Opened. Setting up...")
-            self.disable_all_torque(close_port=False)
-            self.set_operating_mode(self.mode_current_based_position)
-            self.enable_all_torque()
+            self.configure_all_dynamixels()
             
             for dxl_id in self.dxl_ids:
                 if not self.groupSyncRead.addParam(dxl_id):
@@ -104,7 +105,8 @@ class DxlControlNode(Node):
         # --- [4] ROS 통신 설정 ---
         self.create_subscription(Bool, 'torque_cmd', self.torque_callback, 10)
         self.create_subscription(JointState, 'dex_mouse/goal_joint_states', self.goal_joint_state_callback, 10)
-        self.create_subscription(String, 'hand_cmd', self.command_callback, 10)
+        self.create_subscription(
+            Float32MultiArray, 'hand_cmd', self.command_callback, 10)
         self.create_subscription(Bool, 'hand_home', self.home_callback, 10)
         self.create_subscription(Bool, 'hand_reset', self.reset_callback, 10)
         self.create_subscription(Bool, 'teleop_enable', self.teleop_enable_callback, 10)
@@ -113,7 +115,6 @@ class DxlControlNode(Node):
         self.joint_state_pub = self.create_publisher(JointState, 'br_hand/joint_states', 10)
         
         self.timer = self.create_timer(0.01, self.sync_read_callback)
-        self.error_timer = self.create_timer(1.0, self.monitor_errors)
 
     def open_port(self):
         return self.portHandler.openPort()
@@ -124,6 +125,104 @@ class DxlControlNode(Node):
     def set_operating_mode(self, mode):
         for dxl_id in self.dxl_ids:
             self.packetHandler.write1ByteTxRx(self.portHandler, dxl_id, self.addr_operating_mode, mode)
+
+    def write_eeprom_if_changed(self, dxl_id, address, size, value, name):
+        if size == 1:
+            current_value, result, error = self.packetHandler.read1ByteTxRx(
+                self.portHandler, dxl_id, address)
+            write_method = self.packetHandler.write1ByteTxRx
+        else:
+            current_value, result, error = self.packetHandler.read2ByteTxRx(
+                self.portHandler, dxl_id, address)
+            write_method = self.packetHandler.write2ByteTxRx
+
+        if result != COMM_SUCCESS:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to read {name}: "
+                f"{self.packetHandler.getTxRxResult(result)}")
+            return False
+        if error != 0:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to read {name}: "
+                f"{self.packetHandler.getRxPacketError(error)}")
+            return False
+        if current_value == value:
+            return True
+
+        result, error = write_method(self.portHandler, dxl_id, address, value)
+        if result != COMM_SUCCESS:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to set {name}: "
+                f"{self.packetHandler.getTxRxResult(result)}")
+            return False
+        if error != 0:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to set {name}: "
+                f"{self.packetHandler.getRxPacketError(error)}")
+            return False
+
+        self.get_logger().info(
+            f"[ID:{dxl_id}] {name}: {current_value} -> {value}")
+        return True
+
+    def read_current_limit(self, dxl_id):
+        current_limit, result, error = self.packetHandler.read2ByteTxRx(
+            self.portHandler, dxl_id, self.addr_current_limit)
+        if result != COMM_SUCCESS:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to read Current Limit: "
+                f"{self.packetHandler.getTxRxResult(result)}")
+            return None
+        if error != 0:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to read Current Limit: "
+                f"{self.packetHandler.getRxPacketError(error)}")
+            return None
+
+        self.current_limits[dxl_id] = current_limit
+        return current_limit
+
+    def set_max_goal_current(self, dxl_id, refresh_limit=False):
+        current_limit = self.current_limits.get(dxl_id)
+        if refresh_limit or current_limit is None:
+            current_limit = self.read_current_limit(dxl_id)
+        if current_limit is None:
+            return False
+
+        result, error = self.packetHandler.write2ByteTxRx(
+            self.portHandler, dxl_id,
+            self.addr_goal_current, current_limit)
+        if result != COMM_SUCCESS:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to set Goal Current: "
+                f"{self.packetHandler.getTxRxResult(result)}")
+            return False
+        if error != 0:
+            self.get_logger().error(
+                f"[ID:{dxl_id}] Failed to set Goal Current: "
+                f"{self.packetHandler.getRxPacketError(error)}")
+            return False
+
+        self.get_logger().info(
+            f"[ID:{dxl_id}] Goal Current set to motor limit: "
+            f"{current_limit}")
+        return True
+
+    def configure_all_dynamixels(self):
+        self.disable_all_torque(close_port=False)
+        self.set_operating_mode(self.mode_current_based_position)
+
+        for dxl_id in self.dxl_ids:
+            # EEPROM values can only be changed while torque is disabled.
+            self.write_eeprom_if_changed(
+                dxl_id, self.addr_shutdown, 1,
+                self.shutdown_overheating_only, "Shutdown")
+
+            # Current Limit is model-specific. Use each motor's configured
+            # upper bound as Goal Current instead of writing a model constant.
+            self.set_max_goal_current(dxl_id, refresh_limit=True)
+
+        self.enable_all_torque()
 
     def split_to_bytes(self, value):
         return [
@@ -182,15 +281,14 @@ class DxlControlNode(Node):
         error_details = []
         for dxl_id in self.dxl_ids:
             error_val, result, _ = self.packetHandler.read1ByteTxRx(self.portHandler, dxl_id, self.addr_hardware_error)
-            if result == COMM_SUCCESS and error_val != 0:
-                errors = []
-                if error_val & 0x01: errors.append("Input Voltage")
-                if error_val & 0x04: errors.append("Overheating")
-                if error_val & 0x08: errors.append("Encoder")
-                if error_val & 0x10: errors.append("Shock")
-                if error_val & 0x20: errors.append("Overload")
-                error_msg = f"ID{dxl_id}:{'|'.join(errors)}"
-                error_details.append(error_msg)
+            if result != COMM_SUCCESS:
+                continue
+
+            # Ignore hardware errors that are not enabled in Shutdown(63).
+            # The current mask is 0x04, so only overheating is reported.
+            shutdown_error = error_val & self.shutdown_overheating_only
+            if shutdown_error & 0x04:
+                error_details.append(f"ID{dxl_id}:Overheating")
         
         if error_details:
             full_err_msg = f"ERROR! {', '.join(error_details)}"
@@ -230,9 +328,7 @@ class DxlControlNode(Node):
             time.sleep(1.0)
 
             self.get_logger().info("Re-configuring...")
-            self.disable_all_torque(close_port=False)
-            self.set_operating_mode(self.mode_current_based_position)
-            self.enable_all_torque()
+            self.configure_all_dynamixels()
 
             self.get_logger().info("Reset Complete. Homing...")
             self.is_resetting = False 
@@ -248,7 +344,7 @@ class DxlControlNode(Node):
             # 1. AA 정렬 (중앙으로)
             self.get_logger().info("Homing Step 1: Aligning AA...")
             for dxl_id in self.aa_ids:
-                self.packetHandler.write2ByteTxRx(self.portHandler, dxl_id, self.addr_goal_current, self.default_current_limit)
+                self.set_max_goal_current(dxl_id)
             
             # AA는 일단 0으로 보냄 (Homing 중에는 0이 중앙이라고 가정하거나, Homing Offset이 이미 적용되어 있다면 0으로 이동)
             # 여기서는 Homing process이므로 절대위치 0보다는, 센서 기준 정렬이 필요할 수 있으나
@@ -281,7 +377,7 @@ class DxlControlNode(Node):
                 self.packetHandler.write4ByteTxRx(self.portHandler, dxl_id, self.addr_homing_offset, new_offset & 0xFFFFFFFF)
                 self.packetHandler.write1ByteTxRx(self.portHandler, dxl_id, self.addr_torque_enable, 1)
                 self.packetHandler.write4ByteTxRx(self.portHandler, dxl_id, self.addr_goal_position, 0)
-                self.packetHandler.write2ByteTxRx(self.portHandler, dxl_id, self.addr_goal_current, self.default_current_limit)
+                self.set_max_goal_current(dxl_id)
 
             self.get_logger().info("Homing Complete!")
 
@@ -379,21 +475,19 @@ class DxlControlNode(Node):
     def command_callback(self, msg):
         if self.is_homing or self.is_resetting:
             return
-        try:
-            data_str = msg.data
-            parts = data_str.split(':')
-            if len(parts) == 2:
-                target_id = int(parts[0])
-                val_str = parts[1]
-                if target_id in self.dxl_ids:
-                    try:
-                        abstract_val = float(val_str)
-                        raw_pos = self.get_raw_pos_from_abstract(target_id, abstract_val)
-                        self.send_batch_positions({target_id: raw_pos})
-                    except ValueError:
-                        pass
-        except ValueError:
-            pass
+
+        if len(msg.data) != len(self.dxl_ids):
+            self.get_logger().warn(
+                f"Ignoring hand_cmd with {len(msg.data)} values; "
+                f"expected {len(self.dxl_ids)}")
+            return
+
+        target_batch = {}
+        for dxl_id, abstract_val in zip(self.dxl_ids, msg.data):
+            target_batch[dxl_id] = self.get_raw_pos_from_abstract(
+                dxl_id, float(abstract_val))
+
+        self.send_batch_positions(target_batch)
 
     def enable_all_torque(self):
         for dxl_id in self.dxl_ids:
